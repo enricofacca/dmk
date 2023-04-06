@@ -2,6 +2,8 @@ import sys
 import os
 from copy import deepcopy as cp
 
+import numpy as np
+
 sys.path.append('../src/dmk')
 from dmk import SpaceDiscretization
 from dmk import TdensPotential
@@ -14,55 +16,45 @@ from dolfin import UnitSquareMesh
 from dolfin import *
 
 from dolfin import norm
+import mshr
 
 
-class Rect(UserExpression):
-    """
-    Define forcing term in readable in fenics assembler
-    Test case in
-    - Facca et. al 2018 https://doi.org/10.1137/16M1098383
-    - Facca et. a. 2021 
-    """
-    def eval(self, value, x):
-        """
-        Define Forcing as F(|x,y|)
-        """
-        value[0]=0.0
-        if ( x[1]>=1/4 and x[1]<3/4):
-            if ( x[0]>=1/8 and x[0]<=3/8):
-                value[0]=2
-            if ( x[0]>=5/8 and x[0]<=7/8):
-                value[0]=-2
 
-class OptimalTdensRect(UserExpression):
-    """Define Optimal Transport density assocaited to 
-    forcing term in readable in fenics assembler 
-    Test case in 
-    - Facca et. al 2018 https://doi.org/10.1137/16M1098383 
-    - Facca et. a. 2021
-
-    """
-    def eval(self, value, x):
-        """
-        Define Forcing as F(|x,y|)
-        """
-        value[0]=0.0
-        if ( x[1]>=1/4 and x[1]<3/4):
-            if ( x[0]>=1/8 and x[0]<=3/8):
-                value[0]=2*(x[0]-1/8)
-            if ( x[0]>3/8 and x[0]<5/8):
-                value[0]=0.5
-            if ( x[0]>=5/8 and x[0]<=7/8):
-                value[0]=2*(7/8-x[0])
-
-# create uniform grid of square [0,1]x[0,1]
+# create grid of square [0,1]x[0,1] and hole inside
 ndiv = 32
-mesh = UnitSquareMesh(ndiv, ndiv)
+inner_radius = 0.1
+domain = mshr.Rectangle(Point(0,0), Point(1,1)) - mshr.Circle(Point(0.5,0.5), inner_radius)
+mesh = mshr.generate_mesh(domain, ndiv)
 
-# set expression for forcing term
-forcing=Rect()
-optimal_tdens=OptimalTdensRect()
 
+# set expression for forcing term and boundary condition at inner boundary
+forcing=Constant(1.0)
+tol=1e-1
+def inner_boundary(x, on_boundary):
+    if on_boundary:
+        if ( ((x[0]-1/2)*(x[0]-1/2)+(x[1]-1/2)*(x[1]-1/2)) < inner_radius*inner_radius + tol ):
+            return True
+        else:
+            return False
+    else:
+        return False
+
+class Distance(UserExpression):
+    """
+    Define distance from 
+    """
+    def eval(self, value, x):
+        """
+        Define Forcing as F(|x,y|)
+        """
+        value[0]= x[0];#100*((x[0]-1/2)*(x[0]-1/2)+(x[1]-1/2)*(x[1]-1/2))
+
+        
+distance_from_source = Expression("sqrt((x[0]-0.5)*(x[0]-0.5)+(x[1]-0.5)*(x[1]-0.5))", degree=6)
+
+print(distance_from_source([0.6,0.5]))
+#distance_from_source = Distance()
+bc=[inner_boundary, distance_from_source]
 
 # Define problem disctetization
 p1p0 = SpaceDiscretization(mesh)
@@ -70,41 +62,45 @@ p1p0 = SpaceDiscretization(mesh)
 # Create a class descibing problem inputs given
 # a Space Discretization and fill it
 mkeqs = PLaplacianProblem(p1p0)
-mkeqs.set(forcing)
+mkeqs.set(forcing,[bc])
 
 # Define problem solution
 tdpot = TdensPotential(p1p0)
 
+
 # init iterative solver
-ctrl_solver = DmkControls(time_discretization_method='explicit_tdens',
-                          tolerance_nonlinear = 1e-6)
+ctrl_solver = DmkControls(time_discretization_method='explicit_tdens')
 dmk_solver = DmkSolver(p1p0,ctrl_solver)
 
 
 # solve initial elliptic equation
 ierr=1
 dmk_solver.syncronize(mkeqs,tdpot,ierr)
-
-
+i=0
+#"""
 # solve initial elliptic equation
 tdens_old = Function(p1p0.tdens_fem_space)
 time = 0
-for i in range(1000):
+for i in range(100):
     tdens_old.vector()[:] = tdpot.tdens.vector()[:]
     time += dmk_solver.ctrl.deltat
     dmk_solver.iterate(mkeqs,tdpot,ierr)
     diff=project(tdens_old-tdpot.tdens,p1p0.tdens_fem_space)
     variation = norm(diff,'l2')
-    print(min(tdpot.tdens.vector()),max(tdpot.tdens.vector()))
+
     print('var tdens = {:.1e}'.format(variation))
 
-    print(variation,variation < 1e-4)
-    if (variation < 1e-4):
-        break
+    diff=project(distance_from_source-tdpot.pot,p1p0.pot_fem_space)
+    error = norm(diff,'l2')
+    print('Error distance', error)
     
+    if (variation < 1e-3):
+        break
+#""" 
 
 # Save exact gradeint in xdmf format
 name_file_out=("runs/ndiv"+str(ndiv)+"tdenspot.xdmf")
+print(name_file_out)
 file_out=XDMFFile(MPI.comm_world, name_file_out)
 file_out.parameters.update(
     {

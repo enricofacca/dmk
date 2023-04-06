@@ -4,6 +4,8 @@ from copy import deepcopy as cp
 
 import sys
 
+import importlib
+
 import numpy as np
 import scipy as sp
 import scipy.sparse.linalg as splinalg
@@ -13,35 +15,22 @@ import os
 #from .linear_solvers import info_linalg
 
 
-from dolfin import UserExpression
-from dolfin import FiniteElement
-from dolfin import FunctionSpace
-from dolfin import Function
-from dolfin import TrialFunction
-from dolfin import TestFunction
-from dolfin import MixedFunctionSpace
+import dolfinx as df
+import ufl
+from ufl import dx, grad, inner, dot
+from dolfinx import mesh as mesh_tools
 
-from dolfin import DirichletBC
+
+from petsc4py import PETSc as p4py_PETSc
+from mpi4py import MPI
 
 
 # function operations
-from dolfin import derivative
-from dolfin import grad
-from dolfin import dot
-
-# other
-from dolfin import BlockMatrix
-from dolfin import BlockVector
-from dolfin import norm
-from dolfin import UnitIntervalMesh
-from dolfin import parameters
-from dolfin import PETScOptions
-from dolfin import PETScKrylovSolver
-from dolfin.fem.solving import solve
-
-# integration
-from dolfin import dx
-from dolfin import assemble
+#from dolfinx import derivative
+#from dolfinx import grad
+#from dolfinx import dot
+#from dolfinx import dx
+#from dolfinx import assemble
 
 
 from linear_algebra import transpose
@@ -52,34 +41,35 @@ class SpaceDiscretization:
     """
     Class containg fem discretization variables
     """
-    def __init__(self,mesh,
-                 space_pot='CR',degree_pot=1,
-                 space_tdens='DG', degree_tdens=0):
+    def __init__(self,mesh):
        #tdens_fem='DG0',pot_fem='P1'):
        """
        Initialize FEM spaces used to discretized the problem
-       """  
+       """
+       self.mesh = mesh
+       
        # For Pot unknow, create fem, function space, trial and test functions 
-       self.pot_fem = FiniteElement(space_pot, mesh.ufl_cell(), degree_pot)
-       #self.pot_fem = FiniteElement('CG', mesh.ufl_cell(), 1)
-       self.pot_fem_space = FunctionSpace(mesh, self.pot_fem)
-       self.pot_trial = TrialFunction(self.pot_fem_space)
-       self.pot_test = TestFunction(self.pot_fem_space)
+       #self.pot_fem = df.FiniteElement(mesh, ('Crouzeix-Raviart',1))
+       self.pot_fem_space = df.fem.FunctionSpace(mesh, ('Crouzeix-Raviart',1))
+       self.pot_trial = ufl.TrialFunction(self.pot_fem_space)
+       self.pot_test = ufl.TestFunction(self.pot_fem_space)
        
        
        # For Tdens unknow, create fem, function space, test and trial
        # space
-       self.tdens_fem = FiniteElement(space_tdens, mesh.ufl_cell(), degree_tdens)
-       self.tdens_fem_space = FunctionSpace(mesh, self.tdens_fem)
-       self.tdens_trial = TrialFunction(self.tdens_fem_space)
-       self.tdens_test = TestFunction(self.tdens_fem_space)
+       #self.tdens_fem = df.FiniteElement('DG', mesh.ufl_cell(), 0)
+       self.tdens_fem_space = df.fem.FunctionSpace(mesh, ('DG',0))
+       self.tdens_trial = ufl.TrialFunction(self.tdens_fem_space)
+       self.tdens_test = ufl.TestFunction(self.tdens_fem_space)
 
        # create mass matrix $M_i,j=\int_{\xhi_l,\xhi_m}$ with
        # $\xhi_l$ funciton of Tdens
-       self.tdens_mass_matrix = assemble(self.tdens_trial*self.tdens_test*dx)
+       a = df.fem.form (self.tdens_trial * self.tdens_test*ufl.dx)
+       self.tdens_mass_matrix = df.fem.assemble_matrix(a)
 
+       print( self.tdens_mass_matrix)
        # create the mixed function space
-       self.pot_tdens_fem_space = FunctionSpace(mesh, self.tdens_fem * self.tdens_fem)
+       #self.pot_tdens_fem_space = df.FunctionSpace(mesh, self.tdens_fem * self.tdens_fem)
 
     def build_stiff(self,conductivity):
         """
@@ -95,9 +85,9 @@ class SpaceDiscretization:
 
         u = self.pot_trial
         v = self.pot_test
-        a = conductivity * dot( grad(u), grad(v) ) * dx
+        a = df.fem.form( conductivity * dot( grad(u), grad(v) ) * dx )
 
-        stiff=assemble(a)
+        stiff = df.fem.assemble_matrix(a)
         
         return stiff;
 
@@ -123,19 +113,26 @@ class TdensPotential:
         
         """
         #: Tdens function
-        self.tdens = Function(problem.tdens_fem_space)
-        self.tdens.vector()[:]=1.0
-        self.tdens.rename("tdens","Optimal Transport Tdens")
+        self.tdens = df.fem.Function(problem.tdens_fem_space)
+        #self.tdens.project(
+        #    df.fem.Constant(problem.mesh,
+        #                    p4py_PETSc.ScalarType(1))
+        #)
+        #print(dir(self.tdens))
+        print(dir(self.tdens.vector))
+        self.tdens.vector.setArray( p4py_PETSc.ScalarType(1))
+        #print(self.tdens.x)
+        self.tdens.name="TransportDensity"
         
         #: Potential function
-        self.pot = Function(problem.pot_fem_space)
-        self.pot.vector()[:]=0.0
-        self.pot.rename("Pot","Kantorovich Potential")
+        self.pot = df.fem.Function(problem.pot_fem_space)
+        self.pot.vector.setArray( p4py_PETSc.ScalarType(0))
+        self.pot.name="Potential"
         
         #: int: Number of tdens variable
-        self.n_tdens = self.tdens.vector().size()
+        self.n_tdens = self.tdens.vector.size
         #: int: Number of pot variable 
-        self.n_pot = self.pot.vector().size()
+        self.n_pot = self.pot.vector.size
 
         # define implicitely the velocity
         self.velocity = self.tdens * grad(self.pot) 
@@ -153,9 +150,7 @@ class PLaplacianProblem:
         self.p_exponent = 1e15
         self.q_exponent = 1
 
-    def set(self,forcing, #forcing term function
-            dirichlet_bcs=[], # boundary conditions list in [[where, function]]
-            p_laplacian=1e15):
+    def set(self,forcing,p_laplacian=1e15):
         """
         Method to set problem inputs.
 
@@ -164,10 +159,9 @@ class PLaplacianProblem:
                          A vel = rhs
             q_exponent (real) : exponent q of the norm |vel|^q
         """
-        self.rhs_integrated = assemble(forcing*self.fems.pot_test*dx)
-        self.bcs=[]
-        for bc in dirichlet_bcs:
-            self.bcs.append(DirichletBC(self.fems.pot_fem_space, bc[1], bc[0]))
+        self.rhs_integrated = df.fem.assemble_vector(
+            df.fem.form(forcing*self.fems.pot_test * ufl.dx))
+        
         self.p_exponent = p_laplacian
         self.q_exponent = 1 + 1 / (p_laplacian - 1)
         return self
@@ -214,9 +208,7 @@ class DmkControls:
         
         #: real: minimum newton step
         self.min_newton_step = 5e-2
-        #: real: contraction of newton step in line search
         self.contraction_newton_step = 1.05
-        #: lower bound for inversion of C in the fully reduced approach
         self.min_C = 1e-6
         
         
@@ -224,14 +216,12 @@ class DmkControls:
         self.outer_prec_fillin=20
         #: Drop tolerance for incomplete factorization
         self.outer_prec_drop_tolerance=1e-4
-        #: relaxation added to matrix used as preconditioner
         self.relax4prec = 1e-12
 
         #: info on standard output
         self.verbose=0
         #: info on log file
         self.save_log=0
-        #: log file path
         self.file_log='admk.log'
 
 # Create a class to store solver info 
@@ -242,23 +232,8 @@ class InfoDmkSolver():
         self.nonlinear_solver_iterations = 0
         self.nonlinear_sovler_residum = 0.0
 
-
-class Conductivity(UserExpression):
-    """
-    Fenics class for defing the element wise conductivity
-    """
-    def __init__(self, tdens, mesh,  **kwargs):
-        super().__init__(**kwargs)
-        self.tdens = tdens
-        self.mesh = mesh
-
-    def eval_cell(self, values, x, cell):
-        values[0] = self.tdens[cell.index]
-
-    def value_shape(self):
-        return ()
         
-class DmkSolver:#(Solver):
+class DmkSolver:
     """
     Solver class for problem
     -div(|\Pot|^{\plapl-2}\Grad \Pot)= \Forcing
@@ -344,53 +319,56 @@ class DmkSolver:#(Solver):
         # assembly stiff
         start_time = cputiming.time()
         stiff = self.fems.build_stiff(tdpot.tdens)
-        rhs = problem.rhs_integrated.copy()
-        for bc in problem.bcs:
-            bc.apply(stiff, problem.rhs_integrated)
-        
+
+        print(dir(problem.rhs_integrated))
+        print(problem.rhs_integrated)
+        rhs = df.fem.Function(problem.fems.pot_fem_space)
+        print(rhs)
+        #rhs = tdpot.pot.copy()
+        rhs.array = problem.rhs_integrated
+
+
         msg = ('ASSEMBLY'+'{:.2f}'.format(-(start_time - cputiming.time()))) 
         self.print_info(msg,3)        
         
         #
         # solve linear system
         #
-        N = problem.rhs_integrated.size()
-        mesh1d = UnitIntervalMesh(N)
-        VI = FunctionSpace(mesh1d, "DG", 0)
-        u1d = TrialFunction(VI)
-        v1d = TestFunction(VI)
-        Id = assemble(u1d*v1d*dx)*N
+        N = problem.rhs_integrated.array.size
+        print(dir(mesh_tools))
+        mesh1d = mesh_tools.create_unit_interval(MPI.COMM_WORLD,N)
+        VI = df.fem.FunctionSpace(mesh1d, ("DG", 0))
+        u1d = ufl.TrialFunction(VI)
+        v1d = ufl.TestFunction(VI)
+        Id = df.fem.assemble_matrix(df.fem.form( N *u1d * v1d * ufl.dx))
 
-        #stiff.axpy(1e-12,Id,False)
+        print(dir(stiff))
+        stiff.axpy(1e-12,Id,False)
 
-        parameters["linear_algebra_backend"] = "PETSc"
+        df.parameters["linear_algebra_backend"] = "PETSc"
 
         # (algebraic multigrid)
-        PETScOptions.set("ksp_type", "cg")
+        df.PETScOptions.set("ksp_type", "cg")
 
-        #PETScOptions.set("pc_type", "icc")
+        #df.PETScOptions.set("pc_type", "icc")
         #"""
         #MULTIGRID SOLVER
-        PETScOptions.set("pc_type", "gamg")
-        PETScOptions.set("mg_coarse_ksp_type", "preonly")
-        PETScOptions.set("mg_coarse_pc_type", "svd")
+        df.PETScOptions.set("pc_type", "gamg")
+        df.PETScOptions.set("mg_coarse_ksp_type", "preonly")
+        df.PETScOptions.set("mg_coarse_pc_type", "svd")
         #"""
         # Print PETSc solver configuration
-        #PETScOptions.set("ksp_view")
-        #PETScOptions.set("ksp_monitor")
+        #df.PETScOptions.set("ksp_view")
+        #df.PETScOptions.set("ksp_monitor")
         
         # Set the solver tolerance
-        PETScOptions.set("ksp_rtol", 1e-6)
-        PETScOptions.set("ksp_atol", 1e-10)
-
-        parameters["krylov_solver"]["nonzero_initial_guess"] = True
-
+        df.PETScOptions.set("ksp_rtol", self.ctrl.tolerance_nonlinear)
 
         # Create Krylov solver and set operator
-        solver = PETScKrylovSolver()
+        solver = df.PETScKrylovSolver()
         solver.set_operator(stiff)
         solver.set_from_options()
-        solver.solve(tdpot.pot.vector(), problem.rhs_integrated) 
+        solver.solve(tdpot.pot.vector(),problem.rhs_integrated) 
 
         ierr = 0
         
@@ -409,6 +387,7 @@ class DmkSolver:#(Solver):
          tdpot : update tdpot from time t^k to t^{k+1} 
 
         """
+        print(self.ctrl.time_discretization_method)
         if (self.ctrl.time_discretization_method == 'explicit_tdens'):            
             # compute update
             grad_pot = grad(tdpot.pot)
@@ -418,15 +397,11 @@ class DmkSolver:#(Solver):
             pmass=problem.q_exponent/(2-problem.q_exponent)
             rhs_ode = assemble(
                 ( -tdpot.tdens  * dot(grad_pot,grad_pot) + tdpot.tdens**pmass )
-                * self.fems.tdens_test* dx )
+                * self.fems.tdens_test* ufl.dx )
             
             # compute update vectors using mass matrix
-            update = Function(self.fems.tdens_fem_space)
-            PETScOptions.set("ksp_type", "cg")
-            PETScOptions.set("pc_type", "icc")
-            PETScOptions.set("ksp_rtol", 1e-06)
-            
-            solve( self.fems.tdens_mass_matrix, update.vector(), rhs_ode) 
+            update = df.Function(self.fems.tdens_fem_space)
+            df.fem.solving.solve( self.fems.tdens_mass_matrix, update.vector(), rhs_ode) 
             
             # update coefficients of tdens
             tdpot.tdens.vector().axpy(- self.ctrl.deltat, update.vector())
@@ -440,19 +415,19 @@ class DmkSolver:#(Solver):
             # pass in gfvar varaible
             
 
-            gfvar = Function(self.fems.tdens_fem_space)
-            gfvar_old = Function(self.fems.tdens_fem_space)
+            gfvar = df.Function(self.fems.tdens_fem_space)
+            gfvar_old = df.Function(self.fems.tdens_fem_space)
             self.tdens2gfvar(tdpot.tdens,gfvar_old)
             gfvar.vector()[:] = gfvar_old.vector()[:]
-            pot   = Function(self.fems.pot_fem_space)
-            pot_increment = Function(self.fems.pot_fem_space)
-            gfvar_increment = Function(self.fems.tdens_fem_space)
+            pot   = df.Function(self.fems.pot_fem_space)
+            pot_increment = df.Function(self.fems.pot_fem_space)
+            gfvar_increment = df.Function(self.fems.tdens_fem_space)
             
 
             # two varaible allocated for linesearch
-            current_pot = Function(self.fems.pot_fem_space)
-            current_gfvar = Function(self.fems.tdens_fem_space)
-            increment = Function(self.fems.pot_tdens_fem_space)
+            current_pot = df.Function(self.fems.pot_fem_space)
+            current_gfvar = df.Function(self.fems.tdens_fem_space)
+            #increment = df.Function(self.fems.pot_tdens_fem_space)
             print(dir(self.fems.tdens_fem_space))
             print(self.fems.tdens_fem_space.dim())
             diag_C = p4pyPETSc.Vec().createWithArray(np.zeros(self.fems.tdens_fem_space.dim()))
@@ -465,7 +440,7 @@ class DmkSolver:#(Solver):
             # because its already integrated
             Energy = (- 0.5* gfvar**2 * dot(grad(pot), grad(pot))
                       + 0.5 * gfvar**2
-                      + 0.5 * (gfvar - gfvar_old)**2 ) * dx
+                      + 0.5 * (gfvar - gfvar_old)**2 ) * ufl.dx
 
             
             
@@ -503,7 +478,7 @@ class DmkSolver:#(Solver):
                 C_matrix = assemble(derivative(-F_gfvar,gfvar))
 
                 # Create a block matrix
-                jacobian = BlockMatrix(2, 2)
+                jacobian = df.BlockMatrix(2, 2)
                 jacobian[0, 0] = A_matrix
                 jacobian[1, 0] = BT_matrix
                 jacobian[0, 1] = B_matrix
@@ -517,16 +492,16 @@ class DmkSolver:#(Solver):
 
                 
                 # Create a block vector (that is compatible with A in parallel)
-                rhs_newton = BlockVector(2)
+                rhs_newton = df.BlockVector(2)
                 rhs_newton[0] = F_pot_vector
                 rhs_newton[1] = F_gfvar_vector
 
                 # Create a another block vector (that is compatible with A in parallel)
-                increment = BlockVector(2)
+                increment = df.BlockVector(2)
                 increment[0] = pot_increment.vector()
                 increment[1] = gfvar_increment.vector()
 
-                # class myBlockMatrix(object):
+                # class mydf.BlockMatrix(object):
                 #      #petsc preconditioner interface
                 #     def setUp(self, jacobian):
                 #         self.jacobian = jacobian
@@ -534,11 +509,11 @@ class DmkSolver:#(Solver):
                 #     def apply(self,pc,x,y) 
                 
                 #ksp = p4pyPETSc.KSP().create()
-                ksp = PETScKrylovSolver()
+                ksp = df.PETScKrylovSolver()
                 ksp.set_operators(jacobian)
                 # Set PETSc solve type (conjugate gradient) and preconditioner
                 # (algebraic multigrid)
-                PETScOptions.set("ksp_type", "cg")
+                df.PETScOptions.set("ksp_type", "cg")
             
                 ksp.solve(rhs_newton, increment)
                 

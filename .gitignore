@@ -72,3 +72,13 @@ docs/_build
 
 # Mypy Cache
 .mypy_cache/
+
+# fenics jit
+*jitfailure*
+
+# firedrake data
+*vtu
+*pvd
+*h5
+
+tests/runs/

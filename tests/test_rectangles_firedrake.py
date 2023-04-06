@@ -3,20 +3,24 @@ import os
 from copy import deepcopy as cp
 
 sys.path.append('../src/dmk')
-from dmk import SpaceDiscretization
-from dmk import TdensPotential
-from dmk import DmkSolver
-from dmk import DmkControls
-from dmk import PLaplacianProblem
+from dmk_firedrake import SpaceDiscretization
+from dmk_firedrake import TdensPotential
+from dmk_firedrake import DmkSolver
+from dmk_firedrake import DmkControls
+from dmk_firedrake import PLaplacianProblem
 
-from dolfin import UserExpression
-from dolfin import UnitSquareMesh
-from dolfin import *
+from ufl import *
+from ufl.classes import Expr
+from firedrake import UnitSquareMesh
 
-from dolfin import norm
+from firedrake import norm
+from firedrake import Function
+from firedrake import interpolate
+# for writing to file
+from firedrake import File
 
 
-class Rect(UserExpression):
+class Rect(Expr):
     """
     Define forcing term in readable in fenics assembler
     Test case in
@@ -34,7 +38,9 @@ class Rect(UserExpression):
             if ( x[0]>=5/8 and x[0]<=7/8):
                 value[0]=-2
 
-class OptimalTdensRect(UserExpression):
+
+
+class OptimalTdensRect(Expr):
     """Define Optimal Transport density assocaited to 
     forcing term in readable in fenics assembler 
     Test case in 
@@ -56,28 +62,39 @@ class OptimalTdensRect(UserExpression):
                 value[0]=2*(7/8-x[0])
 
 # create uniform grid of square [0,1]x[0,1]
-ndiv = 32
+ndiv = int(sys.argv[1])
 mesh = UnitSquareMesh(ndiv, ndiv)
-
-# set expression for forcing term
-forcing=Rect()
-optimal_tdens=OptimalTdensRect()
-
 
 # Define problem disctetization
 p1p0 = SpaceDiscretization(mesh)
 
+# set expression for forcing term
+#forcing = Rect()
+x, y = SpatialCoordinate(mesh)
+source  = conditional( And(abs(x-0.25) < 0.125, abs(y-0.5)<0.25), 2.0, 0.0) 
+sink    = conditional( And(abs(x-0.75) < 0.125, abs(y-0.5)<0.25), 2.0, 0.0) 
+forcing = source - sink
+
+
+f = Function(p1p0.tdens_fem_space)
+f.interpolate(forcing) 
+
+
+optimal_tdens = OptimalTdensRect()
+
+
+
+
 # Create a class descibing problem inputs given
 # a Space Discretization and fill it
 mkeqs = PLaplacianProblem(p1p0)
-mkeqs.set(forcing)
+mkeqs.set(f)
 
 # Define problem solution
 tdpot = TdensPotential(p1p0)
 
 # init iterative solver
-ctrl_solver = DmkControls(time_discretization_method='explicit_tdens',
-                          tolerance_nonlinear = 1e-6)
+ctrl_solver = DmkControls(time_discretization_method='explicit_tdens')
 dmk_solver = DmkSolver(p1p0,ctrl_solver)
 
 
@@ -93,25 +110,15 @@ for i in range(1000):
     tdens_old.vector()[:] = tdpot.tdens.vector()[:]
     time += dmk_solver.ctrl.deltat
     dmk_solver.iterate(mkeqs,tdpot,ierr)
-    diff=project(tdens_old-tdpot.tdens,p1p0.tdens_fem_space)
+    diff=interpolate(tdens_old-tdpot.tdens,p1p0.tdens_fem_space)
     variation = norm(diff,'l2')
     print(min(tdpot.tdens.vector()),max(tdpot.tdens.vector()))
     print('var tdens = {:.1e}'.format(variation))
 
-    print(variation,variation < 1e-4)
-    if (variation < 1e-4):
+    if (variation < 1e-2):
         break
-    
 
-# Save exact gradeint in xdmf format
-name_file_out=("runs/ndiv"+str(ndiv)+"tdenspot.xdmf")
-file_out=XDMFFile(MPI.comm_world, name_file_out)
-file_out.parameters.update(
-    {
-        "functions_share_mesh": True,
-        "rewrite_function_mesh": False
-    })
-file_out.write(tdpot.tdens, i)
-file_out.write(tdpot.pot, i)
-f_p0=project(forcing, p1p0.tdens_fem_space)
-file_out.write(f_p0, i)
+out_file_name=("runs_firedrake/ndiv"+str(ndiv)+"tdenspot.pvd")
+out_file = File(out_file_name)
+out_file.write(f, time=0)
+#out_file.write(tdpot.pot,time=0)

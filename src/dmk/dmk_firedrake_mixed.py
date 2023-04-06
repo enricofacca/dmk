@@ -13,38 +13,25 @@ import os
 #from .linear_solvers import info_linalg
 
 
-from dolfin import UserExpression
-from dolfin import FiniteElement
-from dolfin import FunctionSpace
-from dolfin import Function
-from dolfin import TrialFunction
-from dolfin import TestFunction
-from dolfin import MixedFunctionSpace
+#from ufl import FiniteElement
+#from ufl import FunctionSpace
+#from firedrake import TrialFunction
+#from firedrake import TestFunction
+#from ufl import MixedFunctionSpace
 
-from dolfin import DirichletBC
+from firedrake import Function
 
 
 # function operations
-from dolfin import derivative
-from dolfin import grad
-from dolfin import dot
+from firedrake import *
 
-# other
-from dolfin import BlockMatrix
-from dolfin import BlockVector
-from dolfin import norm
-from dolfin import UnitIntervalMesh
-from dolfin import parameters
-from dolfin import PETScOptions
-from dolfin import PETScKrylovSolver
-from dolfin.fem.solving import solve
 
 # integration
-from dolfin import dx
-from dolfin import assemble
+from ufl import dx
+from firedrake import assemble
 
 
-from linear_algebra import transpose
+#from linear_algebra_firedrake import transpose
 
 from petsc4py import PETSc as p4pyPETSc
 
@@ -52,16 +39,13 @@ class SpaceDiscretization:
     """
     Class containg fem discretization variables
     """
-    def __init__(self,mesh,
-                 space_pot='CR',degree_pot=1,
-                 space_tdens='DG', degree_tdens=0):
+    def __init__(self,mesh):
        #tdens_fem='DG0',pot_fem='P1'):
        """
        Initialize FEM spaces used to discretized the problem
        """  
        # For Pot unknow, create fem, function space, trial and test functions 
-       self.pot_fem = FiniteElement(space_pot, mesh.ufl_cell(), degree_pot)
-       #self.pot_fem = FiniteElement('CG', mesh.ufl_cell(), 1)
+       self.pot_fem = FiniteElement('Crouzeix-Raviart', mesh.ufl_cell(), 1)
        self.pot_fem_space = FunctionSpace(mesh, self.pot_fem)
        self.pot_trial = TrialFunction(self.pot_fem_space)
        self.pot_test = TestFunction(self.pot_fem_space)
@@ -69,14 +53,15 @@ class SpaceDiscretization:
        
        # For Tdens unknow, create fem, function space, test and trial
        # space
-       self.tdens_fem = FiniteElement(space_tdens, mesh.ufl_cell(), degree_tdens)
+       self.tdens_fem = FiniteElement('DG', mesh.ufl_cell(), 0)
        self.tdens_fem_space = FunctionSpace(mesh, self.tdens_fem)
        self.tdens_trial = TrialFunction(self.tdens_fem_space)
        self.tdens_test = TestFunction(self.tdens_fem_space)
 
        # create mass matrix $M_i,j=\int_{\xhi_l,\xhi_m}$ with
        # $\xhi_l$ funciton of Tdens
-       self.tdens_mass_matrix = assemble(self.tdens_trial*self.tdens_test*dx)
+       M = inner(self.tdens_trial,self.tdens_test)*dx
+       self.tdens_mass_matrix = assemble( M ,mat_type="aij")
 
        # create the mixed function space
        self.pot_tdens_fem_space = FunctionSpace(mesh, self.tdens_fem * self.tdens_fem)
@@ -153,9 +138,7 @@ class PLaplacianProblem:
         self.p_exponent = 1e15
         self.q_exponent = 1
 
-    def set(self,forcing, #forcing term function
-            dirichlet_bcs=[], # boundary conditions list in [[where, function]]
-            p_laplacian=1e15):
+    def set(self,forcing,p_laplacian=1e15):
         """
         Method to set problem inputs.
 
@@ -164,10 +147,7 @@ class PLaplacianProblem:
                          A vel = rhs
             q_exponent (real) : exponent q of the norm |vel|^q
         """
-        self.rhs_integrated = assemble(forcing*self.fems.pot_test*dx)
-        self.bcs=[]
-        for bc in dirichlet_bcs:
-            self.bcs.append(DirichletBC(self.fems.pot_fem_space, bc[1], bc[0]))
+        self.rhs_integrated = assemble( inner(forcing,self.fems.pot_test)*dx  )
         self.p_exponent = p_laplacian
         self.q_exponent = 1 + 1 / (p_laplacian - 1)
         return self
@@ -214,9 +194,7 @@ class DmkControls:
         
         #: real: minimum newton step
         self.min_newton_step = 5e-2
-        #: real: contraction of newton step in line search
         self.contraction_newton_step = 1.05
-        #: lower bound for inversion of C in the fully reduced approach
         self.min_C = 1e-6
         
         
@@ -224,14 +202,12 @@ class DmkControls:
         self.outer_prec_fillin=20
         #: Drop tolerance for incomplete factorization
         self.outer_prec_drop_tolerance=1e-4
-        #: relaxation added to matrix used as preconditioner
         self.relax4prec = 1e-12
 
         #: info on standard output
         self.verbose=0
         #: info on log file
         self.save_log=0
-        #: log file path
         self.file_log='admk.log'
 
 # Create a class to store solver info 
@@ -240,25 +216,10 @@ class InfoDmkSolver():
         self.linear_solver_iterations = 0
         # non linear solver
         self.nonlinear_solver_iterations = 0
-        self.nonlinear_sovler_residum = 0.0
+        self.nonlinear_solver_residum = 0.0
 
-
-class Conductivity(UserExpression):
-    """
-    Fenics class for defing the element wise conductivity
-    """
-    def __init__(self, tdens, mesh,  **kwargs):
-        super().__init__(**kwargs)
-        self.tdens = tdens
-        self.mesh = mesh
-
-    def eval_cell(self, values, x, cell):
-        values[0] = self.tdens[cell.index]
-
-    def value_shape(self):
-        return ()
-        
-class DmkSolver:#(Solver):
+ 
+class DmkSolver:
     """
     Solver class for problem
     -div(|\Pot|^{\plapl-2}\Grad \Pot)= \Forcing
@@ -329,6 +290,30 @@ class DmkSolver:#(Solver):
             print('Derivative order not supported')
         return tdens
 
+    def energy(self, problem, sol):
+
+        pot, tdens = sol.split()
+        
+    
+        # the term u * f is missing
+        # because its already integrated
+        dirichlet_energy = (problem.forcing * pot - 0.5 * tdens * inner(grad(pot), grad(pot)
+                      + 0.5 * tdens ) * dx
+
+
+    def pot_of_tdens_PDE(self, problem, solution):
+        """
+        Set the PDE defining the pot for a given tdens
+        """
+        pot , tdens = solution.slip()
+        u = Function(self.pot_space)  
+        pot_test = TestFunction(self.pot_space)
+        F = ( tdens * inner(grad(tdpot.pot),grad(self.pot_test))
+              - problem.forcing * self.pot_test)* dx
+        bcs= None
+
+        return F, bcs
+                                
     def syncronize(self, problem, tdpot,ierr):
         """        
         Args:
@@ -344,58 +329,47 @@ class DmkSolver:#(Solver):
         # assembly stiff
         start_time = cputiming.time()
         stiff = self.fems.build_stiff(tdpot.tdens)
-        rhs = problem.rhs_integrated.copy()
-        for bc in problem.bcs:
-            bc.apply(stiff, problem.rhs_integrated)
-        
+      
+
         msg = ('ASSEMBLY'+'{:.2f}'.format(-(start_time - cputiming.time()))) 
         self.print_info(msg,3)        
         
         #
         # solve linear system
         #
-        N = problem.rhs_integrated.size()
-        mesh1d = UnitIntervalMesh(N)
-        VI = FunctionSpace(mesh1d, "DG", 0)
-        u1d = TrialFunction(VI)
-        v1d = TestFunction(VI)
-        Id = assemble(u1d*v1d*dx)*N
-
-        #stiff.axpy(1e-12,Id,False)
-
-        parameters["linear_algebra_backend"] = "PETSc"
-
-        # (algebraic multigrid)
-        PETScOptions.set("ksp_type", "cg")
-
-        #PETScOptions.set("pc_type", "icc")
-        #"""
-        #MULTIGRID SOLVER
-        PETScOptions.set("pc_type", "gamg")
-        PETScOptions.set("mg_coarse_ksp_type", "preonly")
-        PETScOptions.set("mg_coarse_pc_type", "svd")
-        #"""
-        # Print PETSc solver configuration
-        #PETScOptions.set("ksp_view")
-        #PETScOptions.set("ksp_monitor")
+       
         
-        # Set the solver tolerance
-        PETScOptions.set("ksp_rtol", 1e-6)
-        PETScOptions.set("ksp_atol", 1e-10)
+        
+        solver_parameters={
+            # global controls
+            #"ksp_monitor": None,
+            #"ksp_view": None,
+            # krylov solver controls
+            #'ksp_type': 'cg',
+            'ksp_atol': 1e-30,
+            'ksp_rtol':  self.ctrl.tolerance_nonlinear,
+            'ksp_divtol': 1e4,
+            'ksp_max_it' : 100,
+            # preconditioner controls
+            #'pc_type': 'hypre',
+            #'pc_hypre_type': 'boomeramg'
+        }
 
-        parameters["krylov_solver"]["nonzero_initial_guess"] = True
+        nullspace = VectorSpaceBasis(constant=True) 
+        solver =  LinearSolver(stiff, # set matrix
+                                  solver_parameters=solver_parameters, # set controls
+                                  nullspace = nullspace )
 
 
-        # Create Krylov solver and set operator
-        solver = PETScKrylovSolver()
-        solver.set_operator(stiff)
-        solver.set_from_options()
-        solver.solve(tdpot.pot.vector(), problem.rhs_integrated) 
+        solver.solve(tdpot.pot,problem.rhs_integrated)
+        self.info.linear_solver_iterations = [solver.ksp.getIterationNumber()]
+        
+        #out_file_name=("runs_firedrake/pot.pvd")
+        #out_file = File(out_file_name)
+        #out_file.write(tdpot.pot, time=0)
 
         ierr = 0
         
-        #return tdpot,ierr,self;
-
     
     def iterate(self, problem, tdpot, ierr):
         """
@@ -409,6 +383,7 @@ class DmkSolver:#(Solver):
          tdpot : update tdpot from time t^k to t^{k+1} 
 
         """
+        print(self.ctrl.time_discretization_method)
         if (self.ctrl.time_discretization_method == 'explicit_tdens'):            
             # compute update
             grad_pot = grad(tdpot.pot)
@@ -422,15 +397,10 @@ class DmkSolver:#(Solver):
             
             # compute update vectors using mass matrix
             update = Function(self.fems.tdens_fem_space)
-            PETScOptions.set("ksp_type", "cg")
-            PETScOptions.set("pc_type", "icc")
-            PETScOptions.set("ksp_rtol", 1e-06)
-            
             solve( self.fems.tdens_mass_matrix, update.vector(), rhs_ode) 
-            
             # update coefficients of tdens
             tdpot.tdens.vector().axpy(- self.ctrl.deltat, update.vector())
-        
+
             # compute pot associated to new tdens
             self.syncronize(problem,tdpot,ierr)
             
